@@ -4,6 +4,7 @@ import argparse
 import logging
 import pathlib
 import os
+import sys
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,41 +20,119 @@ def setup_argparse():
     return parser.parse_args()
 
 
+FORMATS = [
+    {
+        "name": "PNG image",
+        "signature": b"\x89PNG\r\n\x1a\n",
+        "extensions": {".png"},
+        "minimum": 16,
+    },
+    {
+        "name": "JPEG image",
+        "signature": b"\xFF\xD8\xFF",
+        "extensions": {".jpg", ".jpeg"},
+        "minimum": 3,
+    },
+    {
+        "name": "PDF document",
+        "signature": b"%PDF-",
+        "extensions": {".pdf"},
+        "minimum": 8,
+    },
+    {
+        "name": "Windows executable",
+        "signature": b"MZ",
+        "extensions": {".exe", ".dll"},
+        "minimum": 64,
+    },
+    {
+        "name": "ELF executable",
+        "signature": b"\x7FELF",
+        "extensions": {".elf", ".so", ".axf"},
+        "minimum": 5,
+    },
+]
+
+KNOWN_EXTENSIONS = set()
+for _fmt in FORMATS:
+    KNOWN_EXTENSIONS.update(_fmt["extensions"])
+
+
+def _structure_anomaly(fmt, header):
+    """Returns a structure problem string for a matched format, or None."""
+    name = fmt["name"]
+    if name == "PNG image":
+        if header[12:16] != b"IHDR":
+            return "PNG header has no IHDR chunk name at bytes 12 to 15"
+    elif name == "JPEG image":
+        if not (header.startswith(b"\xFF\xD8") and len(header) > 2 and header[2] == 0xFF):
+            return "JPEG header is not an SOI followed by a marker byte 0xFF"
+    elif name == "PDF document":
+        version = header[5:8]
+        if len(version) < 3 or not version[0:1].isdigit() or version[1:2] != b"." or not version[2:3].isdigit():
+            return "PDF header has no version after %PDF-"
+    elif name == "Windows executable":
+        if len(header) < 64:
+            return "MZ header is shorter than the 64 bytes needed to hold the PE offset field"
+    elif name == "ELF executable":
+        if len(header) < 5:
+            return "ELF header has no class byte at offset 4"
+    return None
+
+
 def analyze_file_header(filepath):
     """
     Analyzes the file header of a given file.
-    This is a basic implementation, and more file format signatures can be added.
+
+    Returns:
+        str: "clean" for a clean identification or an unrecognized
+            header, "anomaly" when an anomaly is detected, and
+            "error" when the file cannot be read.
     """
     try:
         with open(filepath, "rb") as f:  # Open in binary mode for header analysis
-            header = f.read(32)  # Read the first 32 bytes (adjust as needed)
-
-        # Example: Check for known file format signatures (can be extended)
-        if header.startswith(b"\x89PNG\r\n\x1a\n"):
-            logging.info(f"File {filepath} appears to be a PNG image.")
-            # Further analysis can be added here, like checking IHDR chunk
-        elif header.startswith(b"\xFF\xD8\xFF"):
-            logging.info(f"File {filepath} appears to be a JPEG image.")
-             # Further analysis can be added here, like checking for valid EXIF data markers
-        elif header.startswith(b"%PDF-"):
-            logging.info(f"File {filepath} appears to be a PDF document.")
-            # Check for a valid PDF version
-        elif header.startswith(b"MZ"):  # Check for Windows executable (MZ header)
-            logging.info(f"File {filepath} might be a Windows executable.")
-             # Perform more in depth checking on PE structure if suspected
-        elif header.startswith(b"\x7FELF"):  # Check for ELF (Linux executable)
-            logging.info(f"File {filepath} might be an ELF executable.")
-        else:
-            logging.warning(f"File {filepath} has an unrecognized header.")
-
+            header = f.read(256)
     except FileNotFoundError:
         logging.error(f"File not found: {filepath}")
-        return False
+        return "error"
     except IOError as e:
         logging.error(f"Error reading file {filepath}: {e}")
-        return False
+        return "error"
 
-    return True
+    suffix = pathlib.Path(filepath).suffix.lower()
+
+    for fmt in FORMATS:
+        signature = fmt["signature"]
+        if header.startswith(signature):
+            logging.info(f"File {filepath} appears to be a {fmt['name']}.")
+            anomalies = []
+            if len(header) < fmt["minimum"]:
+                anomalies.append(
+                    f"truncated {fmt['name']} header: {len(header)} bytes is shorter than the minimum structure of {fmt['minimum']} bytes"
+                )
+            else:
+                problem = _structure_anomaly(fmt, header)
+                if problem:
+                    anomalies.append(problem)
+            if suffix in KNOWN_EXTENSIONS and suffix not in fmt["extensions"]:
+                anomalies.append(
+                    f"extension {suffix} does not match the {fmt['name']} signature"
+                )
+            for anomaly in anomalies:
+                logging.error(f"Anomaly detected: {anomaly} in file {filepath}.")
+            return "anomaly" if anomalies else "clean"
+
+    # A file that is a proper prefix of a known signature is truncated.
+    for fmt in FORMATS:
+        signature = fmt["signature"]
+        if header and signature.startswith(header):
+            logging.error(
+                f"Anomaly detected: truncated {fmt['name']} header: file is shorter than the {len(signature)} byte signature in file {filepath}."
+            )
+            return "anomaly"
+
+    logging.warning(f"File {filepath} has an unrecognized header.")
+    return "clean"
 
 
 def main():
@@ -66,34 +145,45 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.log_file:
-        file_handler = logging.FileHandler(args.log_file)
-        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logging.getLogger().addHandler(file_handler)
-
     filepath = args.filepath
 
     # Input Validation
     if not isinstance(filepath, str):
         logging.error("Filepath must be a string.")
-        return
+        sys.exit(1)
 
     file_path_obj = pathlib.Path(filepath)
 
+    if args.log_file:
+        # Settled ruling, applied to the log path: never write log
+        # output into the file being analyzed.
+        if pathlib.Path(args.log_file).resolve() == file_path_obj.resolve():
+            logging.error(f"Log file is the file being analyzed, refusing: {args.log_file}")
+            sys.exit(1)
+        try:
+            file_handler = logging.FileHandler(args.log_file)
+        except OSError as e:
+            logging.error(f"Error opening log file {args.log_file}: {e}")
+            sys.exit(1)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(file_handler)
+
     if not file_path_obj.exists():
         logging.error(f"File does not exist: {filepath}")
-        return
-    
+        sys.exit(1)
+
     if not file_path_obj.is_file():
         logging.error(f"Path is not a file: {filepath}")
-        return
+        sys.exit(1)
 
     if not os.access(filepath, os.R_OK):  #Check file is readable
         logging.error(f"File {filepath} is not readable (check permissions).")
-        return
-    
+        sys.exit(1)
+
     logging.info(f"Analyzing file: {filepath}")
-    analyze_file_header(filepath)
+    result = analyze_file_header(filepath)
+    if result != "clean":
+        sys.exit(1)
 
 
 if __name__ == "__main__":
