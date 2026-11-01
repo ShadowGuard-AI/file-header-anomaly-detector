@@ -91,6 +91,9 @@ def analyze_file_header(filepath):
     """
     try:
         with open(filepath, "rb") as f:  # Open in binary mode for header analysis
+            # Only the first 256 bytes are ever read. Every check in this file,
+            # signature, structure, and truncation, has to be decidable from that
+            # window, which is why the format table asks for so little structure.
             header = f.read(256)
     except FileNotFoundError:
         logging.error(f"File not found: {filepath}")
@@ -106,6 +109,9 @@ def analyze_file_header(filepath):
         if header.startswith(signature):
             logging.info(f"File {filepath} appears to be a {fmt['name']}.")
             anomalies = []
+            # A header shorter than the format minimum reports truncation only.
+            # The structure check is skipped, because the bytes it would inspect
+            # may not exist, and one clear anomaly beats three guesses.
             if len(header) < fmt["minimum"]:
                 anomalies.append(
                     f"truncated {fmt['name']} header: {len(header)} bytes is shorter than the minimum structure of {fmt['minimum']} bytes"
@@ -114,6 +120,9 @@ def analyze_file_header(filepath):
                 problem = _structure_anomaly(fmt, header)
                 if problem:
                     anomalies.append(problem)
+            # The extension is only evidence when it belongs to a different known
+            # format. An unknown extension, or none, says nothing: plenty of real
+            # files carry no extension, and I do not flag a signature for that.
             if suffix in KNOWN_EXTENSIONS and suffix not in fmt["extensions"]:
                 anomalies.append(
                     f"extension {suffix} does not match the {fmt['name']} signature"
@@ -125,6 +134,10 @@ def analyze_file_header(filepath):
     # A file that is a proper prefix of a known signature is truncated.
     for fmt in FORMATS:
         signature = fmt["signature"]
+        # Second pass for files too short to match anything: a file that is a
+        # strict prefix of a signature is a truncated file of that type, not an
+        # unknown one. The empty file is excluded by the header test and falls
+        # through to unrecognized.
         if header and signature.startswith(header):
             logging.error(
                 f"Anomaly detected: truncated {fmt['name']} header: file is shorter than the {len(signature)} byte signature in file {filepath}."
@@ -132,6 +145,8 @@ def analyze_file_header(filepath):
             return "anomaly"
 
     logging.warning(f"File {filepath} has an unrecognized header.")
+    # Unrecognized returns clean on purpose. Unknown is not an anomaly in
+    # this tool's terms; only a known format with something wrong is.
     return "clean"
 
 
@@ -182,6 +197,8 @@ def main():
 
     logging.info(f"Analyzing file: {filepath}")
     result = analyze_file_header(filepath)
+    # Anomaly and error share exit 1. A caller can tell them apart only in
+    # the log, never from the exit code.
     if result != "clean":
         sys.exit(1)
 
